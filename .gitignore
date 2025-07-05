@@ -1,2 +1,3 @@
-# Ignore downloads folder
-downloads/
+# Ignore everything inside any 'downloads' folder
+downloads/*
+!downloads/.gitkeep
