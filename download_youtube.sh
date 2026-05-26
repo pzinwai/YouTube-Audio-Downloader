@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -o pipefail
+
 # ── Colors & symbols ─────────────────────────────────────────────
 BOLD='\033[1m'
 DIM='\033[2m'
@@ -18,6 +20,22 @@ SPINNER_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 log()  { echo -e " ${ARROW}  $1"; }
 ok()   { echo -e " ${TICK}  $1"; }
 fail() { echo -e " ${CROSS}  ${RED}$1${RESET}"; }
+
+require_command() {
+    local cmd="$1"
+    local label="$2"
+
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        fail "$label is not installed or not in PATH."
+        exit 1
+    fi
+}
+
+trim_error_message() {
+    local message="$1"
+    message=$(printf '%s' "$message" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+    printf '%s' "$message"
+}
 
 # Start a background spinner with a message.  Usage: start_spinner "msg"
 start_spinner() {
@@ -76,16 +94,30 @@ echo ""
 read -p "  Enter YouTube URL: " url
 echo ""
 
+require_command "yt-dlp" "yt-dlp"
+require_command "ffmpeg" "ffmpeg"
+
 # Base downloads folder (relative to script location)
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 DOWNLOADS_DIR="$BASE_DIR/downloads"
 mkdir -p "$DOWNLOADS_DIR"
 
+YTDLP_ARGS=(--extractor-args "youtube:player_client=android,web" --no-playlist)
+
+info_error_file=$(mktemp)
+download_error_file=$(mktemp)
+trap 'cleanup; rm -f "$info_error_file" "$download_error_file"' EXIT
+
 # ── Step 1: Fetch video info ─────────────────────────────────────
 start_spinner "Fetching video info…"
-title=$(yt-dlp --get-title "$url" 2>/dev/null)
+title=$(yt-dlp "${YTDLP_ARGS[@]}" --skip-download --print "%(title)s" "$url" 2>"$info_error_file")
 if [[ -z "$title" ]]; then
-    stop_spinner_fail "Could not fetch video info — check the URL."
+    info_error=$(trim_error_message "$(cat "$info_error_file")")
+    if [[ -n "$info_error" ]]; then
+        stop_spinner_fail "Could not fetch video info — $info_error"
+    else
+        stop_spinner_fail "Could not fetch video info — check the URL or update yt-dlp."
+    fi
     exit 1
 fi
 safe_title=$(echo "$title" | tr -cd '[:alnum:] _.-')
@@ -94,8 +126,8 @@ mkdir -p "$folder"
 stop_spinner "Video: ${BOLD}$title${RESET}"
 
 # ── Step 2: Download best audio ──────────────────────────────────
-yt-dlp -f bestaudio --no-playlist --newline --progress \
-    -o "$folder/original.%(ext)s" "$url" 2>&1 \
+yt-dlp "${YTDLP_ARGS[@]}" -f bestaudio/best --newline --progress \
+    -o "$folder/original.%(ext)s" "$url" 2>"$download_error_file" \
     | while IFS= read -r line; do
         # yt-dlp progress lines look like: [download]  45.2% of  5.12MiB ...
         if [[ "$line" =~ \[download\][[:space:]]+([0-9]+(\.[0-9]+)?)% ]]; then
@@ -103,16 +135,35 @@ yt-dlp -f bestaudio --no-playlist --newline --progress \
             progress_bar "$pct" 100 "Downloading…"
         fi
     done
+download_status=$?
 printf "\r\033[K"
+if [[ $download_status -ne 0 ]]; then
+    download_error=$(trim_error_message "$(cat "$download_error_file")")
+    if [[ -n "$download_error" ]]; then
+        fail "Audio download failed — $download_error"
+    else
+        fail "Audio download failed."
+    fi
+    exit 1
+fi
 ok "Audio downloaded"
 
 # Find the downloaded file (e.g., original.webm or original.m4a)
 downloaded_file=$(find "$folder" -name 'original.*' ! -name '*.mp3' ! -name '*.txt' | head -n 1)
+if [[ -z "$downloaded_file" ]]; then
+    fail "Downloaded file was not created."
+    exit 1
+fi
 
 # ── Step 3: Convert to MP3 ───────────────────────────────────────
 start_spinner "Converting to MP3 (192 kbps)…"
 ffmpeg -i "$downloaded_file" -vn -ab 192k -ar 44100 -y "$folder/original.mp3" \
     </dev/null >/dev/null 2>&1
+ffmpeg_status=$?
+if [[ $ffmpeg_status -ne 0 ]]; then
+    stop_spinner_fail "Could not convert audio to MP3."
+    exit 1
+fi
 stop_spinner "Converted to MP3"
 
 # Remove the intermediate audio file
@@ -123,9 +174,9 @@ echo "$title" > "$folder/original_filename.txt"
 
 # ── Step 4: Chapter splitting ────────────────────────────────────
 start_spinner "Checking for chapters…"
-chapters_json=$(yt-dlp --skip-download --print "%(chapters)j" "$url" 2>/dev/null)
+chapters_json=$(yt-dlp "${YTDLP_ARGS[@]}" --skip-download --print "%(chapters)j" "$url" 2>/dev/null)
 
-if [[ "$chapters_json" != "null" && "$chapters_json" != "None" && -n "$chapters_json" ]]; then
+if [[ "$chapters_json" != "null" && "$chapters_json" != "None" && "$chapters_json" != "NA" && -n "$chapters_json" ]]; then
     stop_spinner "Chapters found — splitting into individual MP3s"
     chapters_dir="$folder/chapters"
     mkdir -p "$chapters_dir"
@@ -169,6 +220,12 @@ for i, ch in enumerate(chapters):
 
 print('\r\033[K', end='')
 " "$folder/original.mp3" "$chapters_dir"
+    chapter_split_status=$?
+
+    if [[ $chapter_split_status -ne 0 ]]; then
+        fail "Could not split chapters into MP3 files."
+        exit 1
+    fi
 
     ok "Chapter MP3s saved to ${DIM}chapters/${RESET}"
 else
